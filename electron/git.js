@@ -3,6 +3,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { promisify } = require("node:util");
 const config = require("./config");
+const sync = require("./sync");
 
 const exec = promisify(execFile);
 
@@ -176,6 +177,17 @@ async function runPostCheckout(cwd, script) {
   return { ok: true, ran: true, logs };
 }
 
+// Live-sync mode:
+//   * Stash base if dirty (so we can restore on unselect).
+//   * Detach base's HEAD to the worktree's HEAD commit (so git status in
+//     base reflects what the worktree sees, and shared .git keeps everything
+//     consistent).
+//   * rsync the worktree's working dir into base (overlays uncommitted
+//     changes the worktree has on top of its HEAD).
+//   * Start a chokidar watcher; every change in the worktree mirrors into
+//     base. node_modules / .next / dist etc. are excluded from sync — base
+//     rebuilds those via post-checkout.
+//   * Worktree directory is NEVER removed — the user keeps editing it.
 async function switchToWorktree({ repoPath, worktreePath, branch }) {
   const baseRepo = path.resolve(repoPath);
   const wtPath = path.resolve(worktreePath);
@@ -183,21 +195,16 @@ async function switchToWorktree({ repoPath, worktreePath, branch }) {
   if (baseRepo === wtPath) {
     return { ok: false, error: "Already on the base worktree" };
   }
-
-  // 1. Save current base branch
-  const originalBranch = await currentBranch(baseRepo);
-  if (!originalBranch) return { ok: false, error: "Could not read base branch" };
-  if (originalBranch === branch) {
-    return { ok: false, error: `Base repo is already on ${branch}` };
+  if (!fs.existsSync(wtPath)) {
+    return { ok: false, error: "Worktree directory no longer exists on disk" };
   }
 
-  // Unique markers so we find the right stash later, even if the user has
-  // other stashes lying around.
+  const originalBranch = await currentBranch(baseRepo);
+  if (!originalBranch) return { ok: false, error: "Could not read base branch" };
+
+  // 1. Stash base repo if dirty
   const opId = Date.now().toString(36);
   const baseStashMsg = `${STASH_MSG} base ${opId} ${originalBranch}→${branch}`;
-  const wtStashMsg = `${STASH_MSG} wt ${opId} ${branch}`;
-
-  // 2. Stash base repo if dirty
   let baseStashed = false;
   if (await isDirty(baseRepo)) {
     const s = await git(baseRepo, ["stash", "push", "-u", "-m", baseStashMsg]);
@@ -205,78 +212,61 @@ async function switchToWorktree({ repoPath, worktreePath, branch }) {
     baseStashed = true;
   }
 
-  // 3. Stash the worktree's uncommitted changes (so the worktree can be
-  //    removed cleanly, and so we can carry the changes into base afterwards).
-  //    Stashes live in the shared .git, so they're visible from the base repo.
-  let wtStashed = false;
-  if (fs.existsSync(wtPath) && (await isDirty(wtPath))) {
-    const s = await git(wtPath, ["stash", "push", "-u", "-m", wtStashMsg]);
-    if (!s.ok) {
-      if (baseStashed) {
-        const idx = await findStashIndex(baseRepo, baseStashMsg);
-        if (idx >= 0) await git(baseRepo, ["stash", "pop", `stash@{${idx}}`]);
-      }
-      return { ok: false, error: `git stash (worktree) failed: ${s.stderr}` };
-    }
-    wtStashed = true;
-  }
-
-  // 4. Remove the worktree (frees up the branch)
-  const removed = await git(baseRepo, ["worktree", "remove", wtPath]);
-  if (!removed.ok) {
-    const forced = await git(baseRepo, ["worktree", "remove", "--force", wtPath]);
-    if (!forced.ok) {
-      // Best-effort rollback
-      if (wtStashed && fs.existsSync(wtPath)) {
-        const idx = await findStashIndex(baseRepo, wtStashMsg);
-        if (idx >= 0) await git(wtPath, ["stash", "pop", `stash@{${idx}}`]);
-      }
-      if (baseStashed) {
-        const idx = await findStashIndex(baseRepo, baseStashMsg);
-        if (idx >= 0) await git(baseRepo, ["stash", "pop", `stash@{${idx}}`]);
-      }
-      return { ok: false, error: `git worktree remove failed: ${forced.stderr}` };
-    }
-  }
-
-  // 5. Checkout the branch in base
-  const co = await git(baseRepo, ["checkout", branch]);
-  if (!co.ok) {
-    // Recovery: recreate worktree, pop wt stash back there, pop base stash
-    await git(baseRepo, ["worktree", "add", wtPath, branch]).catch(() => {});
-    if (wtStashed) {
-      const idx = await findStashIndex(baseRepo, wtStashMsg);
-      if (idx >= 0) await git(wtPath, ["stash", "pop", `stash@{${idx}}`]);
-    }
+  // 2. Read worktree's HEAD commit
+  const headR = await git(wtPath, ["rev-parse", "HEAD"]);
+  if (!headR.ok) {
     if (baseStashed) {
       const idx = await findStashIndex(baseRepo, baseStashMsg);
       if (idx >= 0) await git(baseRepo, ["stash", "pop", `stash@{${idx}}`]);
     }
-    return { ok: false, error: `git checkout failed: ${co.stderr}` };
+    return { ok: false, error: `read worktree HEAD: ${headR.stderr}` };
   }
+  const wtHead = headR.stdout.trim();
 
-  // 6. Pop the worktree's stash into base — carries uncommitted changes over
-  let wtPopWarning = null;
-  if (wtStashed) {
-    const idx = await findStashIndex(baseRepo, wtStashMsg);
-    if (idx >= 0) {
-      const pop = await git(baseRepo, ["stash", "pop", `stash@{${idx}}`]);
-      if (!pop.ok) {
-        wtPopWarning = `worktree changes had conflicts: ${pop.stderr.split("\n")[0]}`;
-      }
+  // 3. Detach base to that commit. Base's git state now matches what the
+  //    worktree's HEAD points at, without taking the branch (the worktree
+  //    still owns it).
+  const co = await git(baseRepo, ["checkout", "--detach", wtHead]);
+  if (!co.ok) {
+    if (baseStashed) {
+      const idx = await findStashIndex(baseRepo, baseStashMsg);
+      if (idx >= 0) await git(baseRepo, ["stash", "pop", `stash@{${idx}}`]);
     }
+    return { ok: false, error: `git checkout --detach failed: ${co.stderr}` };
   }
 
-  // 7. Persist active state so we can unselect later
+  // 4. Initial sync: rsync worktree's working dir into base. --delete
+  //    handles files that exist in base (from the checked-out commit) but
+  //    were removed in the worktree.
+  const syncRes = await sync.initialSync(wtPath, baseRepo);
+  if (!syncRes.ok) {
+    // Best-effort rollback
+    await git(baseRepo, ["checkout", originalBranch]).catch(() => {});
+    if (baseStashed) {
+      const idx = await findStashIndex(baseRepo, baseStashMsg);
+      if (idx >= 0) await git(baseRepo, ["stash", "pop", `stash@{${idx}}`]);
+    }
+    return { ok: false, error: `initial rsync failed: ${syncRes.error}` };
+  }
+
+  // 5. Persist active state (used by unselect + UI)
   config.setRepoActive(baseRepo, {
     branch,
     worktreePath: wtPath,
     originalBranch,
     stashed: baseStashed,
     stashMsg: baseStashed ? baseStashMsg : null,
+    liveSync: true,
+    detachedAt: wtHead,
   });
 
-  // 8. Run post-checkout script
+  // 6. Start the file watcher
+  const watcherState = await sync.startWatcher(wtPath, baseRepo, () => {
+    // Hook for future UI updates; we just count events internally.
+  });
+  sync.registerWatcher(baseRepo, watcherState);
+
+  // 7. Run post-checkout in base (npm install etc. — rebuilds node_modules)
   const repoCfg = config.getRepo(baseRepo);
   const post = await runPostCheckout(baseRepo, repoCfg.script);
 
@@ -285,8 +275,7 @@ async function switchToWorktree({ repoPath, worktreePath, branch }) {
     originalBranch,
     branch,
     stashed: baseStashed,
-    broughtWorktreeChanges: wtStashed,
-    wtPopWarning,
+    liveSync: true,
     post,
   };
 }
@@ -297,11 +286,41 @@ async function unselectWorktree({ repoPath }) {
   const active = repoCfg.activeWorktree;
   if (!active) return { ok: false, error: "No active worktree to unselect" };
 
-  const { branch, worktreePath, originalBranch, stashed, stashMsg } = active;
+  const { branch, worktreePath, originalBranch, stashed, stashMsg, liveSync } = active;
 
-  // 1. If the borrowed branch has uncommitted changes in base, stash them so
-  //    we can carry them back into the recreated worktree (symmetric with
-  //    switch, which carried the worktree's changes into base).
+  if (liveSync) {
+    // 1. Stop the watcher
+    await sync.stopWatcher(baseRepo);
+
+    // 2. Discard all synced changes in base.
+    //    reset --hard wipes tracked-file modifications, clean -fd removes
+    //    untracked files/dirs (which is most of what rsync laid down).
+    //    -e is omitted so gitignored files (node_modules etc.) stay.
+    const reset = await git(baseRepo, ["reset", "--hard"]);
+    if (!reset.ok) return { ok: false, error: `git reset failed: ${reset.stderr}` };
+    const clean = await git(baseRepo, ["clean", "-fd"]);
+    if (!clean.ok) return { ok: false, error: `git clean failed: ${clean.stderr}` };
+
+    // 3. Checkout original branch in base
+    const co = await git(baseRepo, ["checkout", originalBranch]);
+    if (!co.ok) return { ok: false, error: `git checkout failed: ${co.stderr}` };
+
+    // 4. Pop the base stash
+    let warning = null;
+    if (stashed) {
+      const idx = await findStashIndex(baseRepo, stashMsg || STASH_MSG);
+      if (idx >= 0) {
+        const pop = await git(baseRepo, ["stash", "pop", `stash@{${idx}}`]);
+        if (!pop.ok) warning = `base stash pop: ${pop.stderr.split("\n")[0]}`;
+      }
+    }
+
+    config.setRepoActive(baseRepo, null);
+    return { ok: true, warning };
+  }
+
+  // ----- Fallback: legacy non-live-sync state (worktree was removed) -----
+
   let restoreMsg = null;
   if (await isDirty(baseRepo)) {
     const opId = Date.now().toString(36);
@@ -309,55 +328,35 @@ async function unselectWorktree({ repoPath }) {
     const s = await git(baseRepo, ["stash", "push", "-u", "-m", restoreMsg]);
     if (!s.ok) return { ok: false, error: `git stash failed: ${s.stderr}` };
   }
-
-  // 2. Switch back to original branch in base
   const co = await git(baseRepo, ["checkout", originalBranch]);
   if (!co.ok) {
-    // Try to restore the stash we just made
     if (restoreMsg) {
       const idx = await findStashIndex(baseRepo, restoreMsg);
       if (idx >= 0) await git(baseRepo, ["stash", "pop", `stash@{${idx}}`]);
     }
     return { ok: false, error: `git checkout failed: ${co.stderr}` };
   }
-
-  // 3. Recreate the worktree at its original path on its branch
   const add = await git(baseRepo, ["worktree", "add", worktreePath, branch]);
   if (!add.ok) {
-    return {
-      ok: false,
-      error: `Switched back, but failed to recreate worktree: ${add.stderr}`,
-    };
+    return { ok: false, error: `Switched back, but failed to recreate worktree: ${add.stderr}` };
   }
-
   let warning = null;
-
-  // 4. Pop the borrowed-branch changes into the new worktree
   let broughtBack = false;
   if (restoreMsg) {
     const idx = await findStashIndex(baseRepo, restoreMsg);
     if (idx >= 0) {
       const pop = await git(worktreePath, ["stash", "pop", `stash@{${idx}}`]);
-      if (!pop.ok) {
-        warning = `worktree restore had conflicts: ${pop.stderr.split("\n")[0]}`;
-      } else {
-        broughtBack = true;
-      }
+      if (!pop.ok) warning = `worktree restore had conflicts: ${pop.stderr.split("\n")[0]}`;
+      else broughtBack = true;
     }
   }
-
-  // 5. Pop the original base stash if we made one on switch
   if (stashed) {
     const idx = await findStashIndex(baseRepo, stashMsg || STASH_MSG);
     if (idx >= 0) {
       const pop = await git(baseRepo, ["stash", "pop", `stash@{${idx}}`]);
-      if (!pop.ok) {
-        warning = (warning ? warning + "; " : "") +
-          `base stash pop: ${pop.stderr.split("\n")[0]}`;
-      }
+      if (!pop.ok) warning = (warning ? warning + "; " : "") + `base stash pop: ${pop.stderr.split("\n")[0]}`;
     }
   }
-
   config.setRepoActive(baseRepo, null);
   return { ok: true, warning, broughtBack };
 }

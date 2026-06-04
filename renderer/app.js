@@ -109,7 +109,7 @@ function renderWorktrees() {
     if (wt.isBase && active) {
       const tag = document.createElement("span");
       tag.className = "tag active";
-      tag.textContent = "borrowed";
+      tag.textContent = active.liveSync ? "syncing ↻" : "borrowed";
       name.appendChild(tag);
     }
     if (wt.changes > 0) {
@@ -125,6 +125,9 @@ function renderWorktrees() {
       const note = document.createElement("div");
       note.className = "sub-note";
       const parts = [];
+      if (active.liveSync) {
+        parts.push(`live-syncing from ${fmtPath(active.worktreePath)}`);
+      }
       if (active.stashed) parts.push(`stashed changes on ${active.originalBranch}`);
       else parts.push(`will restore to ${active.originalBranch}`);
       note.textContent = parts.join(" · ");
@@ -136,9 +139,13 @@ function renderWorktrees() {
     actions.className = "actions";
 
     const branchForOps = wt.branch || null;
+    // While live-syncing, hide commit/PR on the base row — the worktree is
+    // the source of truth, so the user should commit there. Base's git state
+    // is detached anyway, so committing in base wouldn't update the branch.
+    const isLiveSyncBase = wt.isBase && active?.liveSync;
 
     // Commit (any worktree with changes)
-    if (wt.changes > 0 && branchForOps) {
+    if (wt.changes > 0 && branchForOps && !isLiveSyncBase) {
       const b = document.createElement("button");
       b.className = "icon";
       b.title = "Commit changes (auto message)";
@@ -148,7 +155,7 @@ function renderWorktrees() {
     }
 
     // PR (any worktree on a non-base-branchy branch; backend will validate)
-    if (branchForOps) {
+    if (branchForOps && !isLiveSyncBase) {
       const b = document.createElement("button");
       b.className = "icon";
       b.title = "Create PR (auto title & body)";
@@ -292,12 +299,11 @@ async function onSwitch(wt) {
     return;
   }
   let msg = `Switched to ${wt.branch}`;
-  if (res.broughtWorktreeChanges) msg += " · carried worktree changes";
-  if (res.wtPopWarning) msg += " · " + res.wtPopWarning;
+  if (res.liveSync) msg += " · live-syncing";
   if (res.post?.ran) {
     msg += res.post.ok ? " · post-checkout ran" : ` · post-checkout failed at: ${res.post.failed}`;
   }
-  const isError = res.wtPopWarning || (res.post && !res.post.ok);
+  const isError = res.post && !res.post.ok;
   toast(msg, isError ? "error" : "success");
   await loadWorktrees();
 }

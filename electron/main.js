@@ -3,6 +3,11 @@ const path = require("node:path");
 const config = require("./config");
 const git = require("./git");
 const claude = require("./claude");
+const sync = require("./sync");
+
+app.on("before-quit", () => {
+  sync.stopAll();
+});
 
 if (!app.isPackaged) {
   try {

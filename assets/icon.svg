@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" role="img" aria-label="Worktree preview macOS app icon">
+  <defs>
+    <linearGradient id="matteBlue" x1="160" y1="80" x2="864" y2="944" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#2F95F4"/>
+      <stop offset="0.52" stop-color="#2383E8"/>
+      <stop offset="1" stop-color="#1466D3"/>
+    </linearGradient>
+    <radialGradient id="softCenter" cx="50%" cy="40%" r="70%">
+      <stop offset="0" stop-color="#55AEFF" stop-opacity="0.22"/>
+      <stop offset="0.56" stop-color="#2B83EA" stop-opacity="0"/>
+      <stop offset="1" stop-color="#0E4AAE" stop-opacity="0.16"/>
+    </radialGradient>
+    <linearGradient id="whiteGlyph" x1="384" y1="184" x2="704" y2="840" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#F2F7FF"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Transparent canvas outside the app icon. -->
+  <rect x="64" y="64" width="896" height="896" rx="184" fill="url(#matteBlue)"/>
+  <rect x="64" y="64" width="896" height="896" rx="184" fill="url(#softCenter)"/>
+
+  <!-- Matte worktree plus quick-preview mark. -->
+  <g fill="url(#whiteGlyph)">
+    <!-- vertical local branch -->
+    <rect x="463" y="282" width="62" height="460" rx="31"/>
+
+    <!-- top and bottom branch nodes -->
+    <circle cx="494" cy="244" r="62"/>
+    <circle cx="494" cy="780" r="62"/>
+
+    <!-- curved worktree branch -->
+    <path d="M516 289
+             C570 352 641 379 690 449
+             C719 491 719 534 690 575
+             C642 644 571 672 516 735"
+          fill="none" stroke="url(#whiteGlyph)" stroke-width="64" stroke-linecap="round" stroke-linejoin="round"/>
+
+    <!-- right branch node -->
+    <circle cx="705" cy="512" r="62"/>
+
+    <!-- play / preview triangle with softly rounded corners -->
+    <path d="M441 417
+             C441 393 468 379 489 391
+             L642 484
+             C664 497 664 527 642 540
+             L489 633
+             C468 645 441 631 441 607
+             Z"/>
+  </g>
+</svg>
